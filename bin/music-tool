@@ -1,0 +1,896 @@
+#!/usr/bin/perl -w
+
+use strict;
+
+use feature qw(switch say state);
+use Getopt::Long qw(:config pass_through require_order);
+use File::Find;
+use File::Glob qw(:glob);
+use File::Temp qw(tempdir);
+use File::Spec;
+use File::stat;
+
+use Data::Formatter;
+
+use Cue;
+use Cue::Track;
+use File::Basename;
+use MP3::Tag;
+use File::Copy;
+use File::Path qw(make_path);
+
+my %global_opts = ( temp => File::Spec->tmpdir, pattern => '%a/%y_%l/%{mA}%{n0}_%t.%e', 'music-library' => '/net/silver/export/music' );
+
+my @image_suffixes = qw(flac ape wv wav);
+my @lossy_suffixes = qw(mp3 ogg oga);
+my @toc_suffixes = qw(cue toc);
+
+my @image_sfx = with_dot(all_cases(@image_suffixes));
+
+my @image_patt = as_pattern(all_cases(@image_suffixes));
+my @toc_patt = as_pattern(all_cases(@toc_suffixes));
+
+my @cue_props = qw(artist genre album year disk);
+my @cue_track_props = qw(title track);
+my @id3v1_props = qw(artist genre album year title track);
+my @id3v1_no_track_props = qw(artist genre album year);
+my @id3v2_props = qw(TPOS);
+my %cue_to_id3 = (disk => 'TPOS');
+
+
+GetOptions(\%global_opts, qw/dry recursive glob=s regex=s music-library=s pattern=s/) or die;
+Getopt::Long::Configure('no_pass_through');
+
+given (shift) {
+    when ('analyze') {
+	do_analyze(@ARGV);
+    }
+    when ('split') {
+	do_split(@ARGV);
+    }
+    when ('move') {
+	do_move(@ARGV);
+    }
+    when ('copy') {
+	do_copy(@ARGV);
+    }
+    when ('convert') {
+	do_convert(@ARGV);
+    }
+    when (undef) {
+	die "empty command";
+    }
+    default {
+	die "unknown command: $_";
+    }
+}
+
+my %analyze_opts;
+
+sub do_analyze {
+    %analyze_opts = (showinfo => 1);
+    GetOptions(\%analyze_opts, qw/showinfo/);
+
+    say "cd ", getcwd;
+    analyze_dir($_) foreach (@_);
+}
+
+
+=item print_comm (@)
+The C<print_comm>() prints its arguments as a shell comment, line by line
+=cut
+sub print_comm (@) {
+    say '# ', $_ foreach @_;
+}
+
+=item print_comm (@)
+The C<print_warn>() prints its arguments as a shell comment, line by line, prepending with C<!!! WARNING !!!>
+=cut
+sub print_warn (@) {
+    say qq(# !!! WARNING !!!);
+    print_comm @_;
+}
+
+###
+# 1. analyze local audio files
+# 
+# 
+sub analyze_dir {
+    my $dir = File::Spec->canonpath(shift);
+
+    say qq(### $dir);
+
+    my @local_audio;
+    my @target_dirs = analyze_local_audio($dir, \@local_audio);
+    my %local_audio = map {($_, 1)} @local_audio;
+    my %target_dirs = map {($_, 1)} @target_dirs;
+
+    my (@local_dirs, @local_files);
+    
+    opendir my($dh), $dir;
+
+    foreach (sort(readdir($dh))) {
+	next if /^\./;
+
+	$_ = "$dir/$_";
+
+	next when defined $local_audio{$_};
+
+	push @local_dirs, $_ if -d;
+	push @local_files, $_ if -f;
+    }
+
+    close $dh;
+
+    foreach my $d (@local_dirs) {
+	my @dirs = analyze_dir($d);
+	push @local_files, $d unless @dirs;
+	map {$target_dirs{$_} = 1} @dirs;
+    }
+
+    @target_dirs = keys %target_dirs;
+
+    if ($#target_dirs == 0) {
+	fsh_copy_to(@local_files, $target_dirs[0]) if @local_files && $target_dirs[0];
+    } elsif ($#target_dirs > 0) {
+	if (@local_files) {
+	    say qq(# !!! WARNING !!!);
+	    print_warn(sprintf("# cp -r %s <to one of>", fsh_join(@local_files)));
+	    say sprintf("# %s", fsh_quote($_)) foreach @target_dirs;
+	}
+    } else {
+	if (@local_audio) {
+	    print_warn "don't know what to do with following:";
+	    print_comm fsh_quote($_) foreach @local_files;
+	} else {
+	    say qq(# no audio found);
+	}
+    }
+
+    say qq(### end $dir #########################);
+    return @target_dirs;
+}
+
+
+sub get_suffixed_files {
+    my $dir = shift;
+    $dir =~ s/([\[\]\*\?])/\\$1/g;
+    my $glob = sprintf("$dir/*.{%s}", join(',', @_));
+    use File::Glob qw(:glob :nocase);
+    return sort grep {-f} bsd_glob($glob);
+}
+
+sub analyze_local_audio {
+    my $dir = shift;
+    my $files_ref = shift;
+    my @losless = get_suffixed_files($dir, @image_suffixes);
+    my @lossy = get_suffixed_files($dir, @lossy_suffixes);
+    my @toc = get_suffixed_files($dir, @toc_suffixes);
+
+    push @$files_ref, @losless, @lossy, @toc;
+
+    return analyze_tracks(@losless, @lossy) unless @toc;
+
+    my $toc = select_best_toc(@toc);
+
+    return analyze_images($toc, @losless);
+
+}
+
+sub analyze_tracks {
+    my %dirs;
+    
+    foreach (@_) {
+	my $tag = MP3::Tag->new($_);
+
+	my $info = get_info($_);
+
+	my ($fixed_tag, $opts) = correct_id3_info($tag);
+	my $file = get_file_name($fixed_tag);
+
+	if (File::Spec->rel2abs($file) eq File::Spec->rel2abs($_)) {
+	    say qq(# $_ is where it meant to be);
+	    if ($opts) {
+		fsh_update_info($file, $opts);
+	    }
+	    push @{$dirs{''}}, $_;
+	} else {
+	    print_comm "$_ => $file";
+	    show_id3_info($tag);
+	    fsh_copy($_, $opts);
+	    push @{$dirs{dirname($file)}}, $_;
+	}
+    }
+
+    my @k = sort { scalar(@{$dirs{$b}}) <=> scalar(@{$dirs{$a}}) } keys %dirs;
+
+    my $main_dir = shift @k;
+
+    if (@k) {
+	say "# !!! WARNING !!!";
+	say "# While the most files go to $main_dir,";
+	foreach my $d (@k) {
+	    say "# $_" foreach @{$dirs{$d}};
+	    say "# to $d";
+	}
+    }
+
+    return keys %dirs;
+}
+
+{
+
+    my $toc_re = join '|', @toc_suffixes; $toc_re = qr/$toc_re/i;
+    my $mp3_re = join '|', @image_suffixes, @lossy_suffixes; $mp3_re = qr/$mp3_re/i;
+
+    my @common_props = qw(artist genre album year);
+    my @common_track_props = qw(title track);
+
+    sub get_info {
+	my $file = shift;
+	my %info;
+	
+	if ($file =~ $mp3_re) {
+	    my $tag = MP3::Tag->new($file);
+
+	    foreach (qw(artist album))
+	} elsif ($file =~ $toc_re) {
+	} else {
+	    confess "don't know how to get info from $file";
+	}
+
+	return info;
+    }
+}
+
+sub select_best_toc {
+    my $time = -1;
+    my $toc = '';
+
+    foreach (@_) {
+	my $t = stat($_)->mtime();
+	($toc, $time) = ($_, $t) if ($time == -1 || $time < $t);
+    }
+
+    return $toc;
+}
+
+sub analyze_single_image {
+    my $cue = shift;
+
+    my $cue_image = File::Spec->catfile(dirname($cue->file_name()), $cue->image());
+
+    print_comm "TOC " . $cue->file_name();
+
+    my ($image, $time);
+    for (@_) {
+	if (match_cue_image($cue_image, $_)) {
+	    say qq/# image is $_/;
+	 
+	    my $t = stat($_)->mtime();
+	    ($image, $time) = ($_, $t) if (!defined($time) || $t > $time);
+	} else {
+	    say qq/# !!! WARNING !!! unknown file $_/;
+	}
+    }
+
+    if (defined($image)) {
+	show_cue($cue, 1);
+	say sprintf(qq/music-tool split --image=%s %s/, fsh_quote($image), fsh_quote($cue->file_name()));
+    } else {
+	say qq/# !!! DON'T KNOW WHAT TO DO !!!/;
+    }
+
+    my $tag = MP3::Tag->new($image);
+    $tag->track_set(0);
+    $tag->title_set('dummy');
+
+    update_id3_info($tag, cue_to_id3_props(get_cue_props($cue)));
+
+    my $dir = dirname(get_file_name($tag));
+    fsh_copy_to($cue->file_name(), $dir);
+
+    return $dir;
+}
+
+sub show_props {
+    my $multiline = shift;
+    my %props = @_;
+
+    if ($multiline) {
+	print_comm "\t$_\t=> \"$props{$_}\"" foreach keys %props;
+    } else {
+	print_comm join(', ', map("$_ => \"$props{$_}\"", keys %props));
+    }
+}
+
+sub show_cue {
+    return unless defined $analyze_opts{showinfo};
+
+    my $cue = shift;
+    my $track = shift;
+    my $multiline;
+    
+    if (ref($track)) {
+	$multiline = shift;
+    } else {
+	$multiline = $track;
+	$track = undef;
+    }
+
+    show_props($multiline, get_cue_props($cue, $track))
+}
+
+sub show_id3_info {
+    return unless defined $analyze_opts{showinfo};
+
+    my $info = shift;
+    my $multiline = shift;
+    show_props($multiline, get_id3_props($info))
+}
+
+sub update_mp3_info_from_cue {
+    my ($info, $cue) = (shift, shift);
+
+    @_ = (@id3v1_no_track_props, @id3v2_props) unless @_;
+
+    foreach my $prop (@_) {
+	if ($prop =~ /^[A-Z]{4}/) {
+	    $info->select_id3v2_frame_by_descr($prop, $cue->$prop()) if defined $cue->$prop();
+	} else {
+	    my $setter = "${prop}_set";
+	    $info->$setter($cue->$prop()) if defined $cue->$prop();
+	}
+    }
+}
+
+
+sub get_cue_props ($;$) {
+    my ($cue, $track) = @_;
+    my @props;
+    
+    map { push @props, $_, $cue->$_() if defined $cue->$_(); } @cue_props;
+    map { push @props, $_, $track->$_() if defined $track->$_(); } @cue_props if defined $track;
+
+    return @props;
+}
+
+sub get_id3_prop ($$) {
+    my ($info, $prop) = @_;
+    $prop =~ /^[A-Z]{4}/ ? $info->select_id3v2_frame_by_descr($prop) : $info->$prop();
+}
+
+sub get_id3_props ($;@) {
+    my $info = shift;
+    @_ = (@id3v1_props, @id3v2_props) unless @_;
+    my @props;
+
+    map { push @props, $_, get_id3_prop($info, $_) if defined get_id3_prop($info, $_); } @_;
+
+    @props;
+}
+
+sub cue_to_id3_props {
+    my %cue_props = @_;
+    my %id3_props;
+
+    foreach my $prop (keys %cue_props) {
+	if (defined $cue_to_id3{$prop}) {
+	    $id3_props{$cue_to_id3{$prop}} = $cue_props{$prop};
+	} else {
+	    $id3_props{$prop} = $cue_props{$prop};
+	}
+    }
+
+    return %id3_props;
+}
+
+sub update_id3_info {
+    my $info = shift;
+    my %props = @_;
+
+    foreach my $prop (keys %props) {
+	if ($prop =~ /^[A-Z]{4}/) {
+	    $info->select_id3v2_frame_by_descr($prop, $props{$prop});
+	} else {
+	    my $setter = "${prop}_set";
+	    $info->$setter($props{$prop});
+	}
+    }
+}
+
+sub is_multi_track {
+    my $cue = shift;
+    my $image = $cue->file();
+
+    foreach my $track ($cue->tracks()) {
+	return 1 if $track->file() ne $image;
+    }
+
+    undef;
+}
+
+sub analyze_multi_images {
+    my $cue = shift;
+    my $dir = dirname($cue->file_name());
+
+    my %files = map {($_, 1)} @_;
+    my @files_in_cue;
+
+    foreach my $track ($cue->tracks()) {
+	foreach my $file (keys %files) {
+	    if (match_cue_image(File::Spec->catdir($dir, $track->file()), $file)) {
+		delete $files{$file};
+		push @files_in_cue, $file;
+		last;
+	    }
+	}
+    }
+
+    my @dirs = analyze_tracks(@files_in_cue);
+
+    if ($#dirs == 0) {
+	fsh_copy_to($cue->file_name(), $dirs[0]) if $dirs[0];
+    } else {
+    }
+
+    if (%files) {
+	say qq/# !!! WARNING !!!/;
+	say qq/# don't know what to do with the following files/;
+	say "#", fsh_quote($_) foreach keys %files;
+    }
+    
+    return @dirs;
+}
+
+sub analyze_images {
+    my $toc = shift;
+    my $cue = Cue::parse($toc);
+    correct_cue($cue);
+
+    return is_multi_track($cue) ? 
+	analyze_multi_images($cue, @_) : 
+	analyze_single_image($cue, @_);
+}
+
+sub match_cue_image {
+    my ($image, $file) = @_;
+
+    $image = basename($image, @image_sfx);
+    $file = basename($file, @image_sfx);
+
+    return lc($image) eq lc($file);
+}
+
+sub do_convert {
+    my @files = find_files(@ARGV);
+
+    
+}
+
+sub do_move {
+    my @files = find_files(@ARGV);
+    foreach my $file (@files) {
+	my $tag = MP3::Tag->new($file);
+
+	my $new_file = get_file_name($tag);
+	print "$file ==> $new_file\n";
+	my (undef, $dir, undef) = fileparse($new_file);
+	-d $dir || make_path($dir) or warn "can't create $dir: $!";
+	move($file, $new_file) or warn "can't move $file to $new_file: $!";
+    }
+}
+
+my %copy_opts;
+
+sub do_copy {
+    GetOptions(\%copy_opts, qw/artist=s album=s name=s track=n disk=n/);
+    my @files = find_files(@ARGV);
+    foreach my $file (@files) {
+	my $tag = MP3::Tag->new($file);
+
+	$tag->artist_set($copy_opts{artist}) if $copy_opts{artist};
+	$tag->album_set($copy_opts{album}) if $copy_opts{album};
+	$tag->select_id3v2_frame_by_descr('TPOS', $copy_opts{disk}) if $copy_opts{disk};
+
+	my $new_file = get_file_name($tag);
+
+	say qq/$file ==> $new_file/;
+	my (undef, $dir, undef) = fileparse($new_file);
+	-d $dir || make_path($dir) || do { warn "can't create $dir: $!"; next; };
+	copy($file, $new_file) or do { warn "can't move $file to $new_file: $!"; next; };
+	
+	my $new_tag = MP3::Tag->new($new_file);
+
+	$tag->copy_id3v2_frames($new_tag, 1);
+	$new_tag->update_tags(scalar($tag->autoinfo()));
+    }
+}
+
+{
+my %split_opts = ();
+
+sub temp_dir {
+    $global_opts{'music-library'} && File::Spec->catfile($global_opts{'music-library'}, 'tmp') || File::Spec->tmpdir;
+}
+
+sub do_split {
+    GetOptions(\%split_opts, qw/artist=s genre=s album=s year=n disk=n image=s/) or die;
+    my @cues = find_files(@ARGV);
+    foreach my $cue_file (@cues) {
+	my $cue = Cue::parse($cue_file);
+	correct_cue($cue);
+
+	for my $prop (qw(artist genre album year disk)) {
+	    $cue->$prop($split_opts{$prop}) if defined $split_opts{$prop};
+	}
+
+	my $dir = tempdir("mt_s_XXXXXX", DIR => temp_dir(), CLEANUP => 1);
+	split_image($cue, $dir);
+	tag_files($cue);
+	rename_files($cue);
+    }
+}
+
+sub correct_cue {
+    my $cue = shift;
+    my ($album, $year, $disk) = correct_album($cue->album(), $cue->year());
+
+    $cue->album($album);
+    $cue->year($year);
+    $cue->disk($disk);
+}
+
+sub correct_album {
+    my ($album, $year) = (shift, shift);
+
+    $album = $1 if defined($year) && $album =~ /^$year\s*([^ ].*)/;
+    ($year, $album) = ($1, $2) if !defined($year) && $album =~ /^(\d{4})\s*([^ ].*)/;
+
+    my $disk;
+    $disk = $2 if ($album =~ s/\s*([\{\[\(\/]?(?:cd|disk)\s*(\d+)[\/\]\}\)]?)//i);
+
+    $album =~ s/\s*\[.*$//;
+
+    return ($album, $year, $disk);
+}
+
+
+sub correct_id3_info {
+    my $info = shift;
+    my @opts;
+    my %props = get_id3_props($info, qw(album year TPOS));
+
+    my ($album, $year, $disk) = correct_album($info->album(), $info->year());
+    my %update = (album => $album, year => $year, TPOS => $disk);
+
+    foreach (keys %update) {
+	push @opts, "--$_=" . fsh_quote($update{$_}) if defined $update{$_} && $update{$_} !~ $props{$_};
+    }
+
+    update_id3_info($info, %update);
+
+    return ($info, join(' ', @opts));
+}
+
+
+sub tag_files {
+    my ($cue) = @_;
+
+    foreach my $track ($cue->tracks()) {
+	my $tag = MP3::Tag->new($track->{file});
+
+	$track->{tag} = $tag;
+	update_id3_info($tag, cue_to_id3_props(get_cue_props($cue, $track)));
+	$tag->update_tags({});
+    }
+}
+
+sub rename_files {
+    my ($cue) = @_;
+
+    foreach my $track ($cue->tracks()) {
+	my $tag = $track->{tag};
+	my $file = $track->{file};
+	my $new_file = get_file_name($tag);
+	print "$file ==> $new_file\n";
+	my (undef, $dir, undef) = fileparse($new_file);
+	-d $dir || make_path($dir) or warn "can't create $dir: $!";
+	
+	move($file, $new_file) or warn "can't move $file to $new_file: $!";
+    }
+}
+
+sub get_file_name {
+    my $tag = shift;
+    my $root_comp = $global_opts{'music-library'};
+    my $name_comp = join('', map { /^%/ ? interpolate_fs($_, $tag) : $_ } split_pattern($global_opts{pattern}));
+    my @path;
+
+    push @path, $root_comp;
+    push @path, 'lossy' if (is_lossy($tag));
+    push @path, $name_comp;
+
+    return File::Spec->catfile(@path);
+#    return File::Spec->catfile($global_opts{'music-library'}, join('', map { /^%/ ? interpolate_fs($_, $tag) : $_ } split_pattern($global_opts{pattern})));
+}
+
+sub is_lossy {
+    my $tag = shift;
+    my $ext = $tag->filename_extension_nodot();
+
+    foreach (@lossy_suffixes) {
+	return 1 if $_ eq $ext;
+    }
+
+    undef;
+}
+
+sub interpolate_fs {
+    my ($str, $tag) = @_;
+
+    $str = $tag->interpolate($str);
+    $str =~ tr(- ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ\x80-\x9F)
+              (  !cLXY|S"Ca<__R~o+23'mP.,1o>...?AAAAAAACEEEEIIIIDNOOOOOx0UUUUYpbaaaaaaaceeeeiiiidnooooo:ouuuuyPy_);
+    $str =~ s/\s+/ /g;
+    $str =~ s/\s*-\s*/-/g;
+    $str =~ s/[()?|.:!,;\/õ"\\\' <>|&]/_/g;
+    $str;
+}
+
+sub split_pattern {
+    my $patt = shift;
+    my @parts;
+
+    while ($patt =~ /([^%]*)(%([- 0]?[[:digit:]]+)?([.][[:digit:]]+)?([^{]|{[^}]+}))?/g) {
+	push(@parts, $1) if $1;
+	push(@parts, $2) if $2;
+    }
+
+    return @parts;
+}
+
+sub shn_format {
+    return 'flac';
+}
+
+sub get_image {
+    my $cue = shift;
+    my $image = $cue->image();
+
+    my (undef, $dir, undef) = fileparse($cue->file_name());
+    $image = "$dir$image";
+
+    return $image if -f $image;
+
+    my ($name,$path,$suffix) = fileparse($image, @image_sfx);
+    
+    foreach my $s (@image_sfx) {
+	next if $s eq $suffix;
+	$image = "$path$name$s";
+	return $image if -f $image;
+    }
+
+    return undef;
+}
+
+sub split_image {
+    my ($cue, $dir) = @_;
+    my $image = $split_opts{image} || get_image($cue) or die "can't find image file for $cue!";
+    shnsplit($cue, $image, $dir);
+}
+
+sub shnsplit {
+    my ($cue_data, $image, $dir) = @_;
+
+    my ($output_format, $output_ext) = ("flac", "flac");
+    my $c = "";
+
+    if (defined($cue_data->track(0))) {
+	$c = "-c 0 ";
+	$cue_data->track(0)->{file} = "$dir/00.$output_ext";
+    }
+
+    open(SHN, qq(| shnsplit $c -O always -a "$dir/" -o $output_format "$image")) or die "can't execute `shnsplit': $!";
+
+
+    foreach my $track ($cue_data->tracks()) {
+	$track->{file} = "$dir/$track->{track}.$output_ext";
+	print SHN qq($track->{index}\n);
+    }
+
+    close(SHN) or die "error waiting for `shnsplit': $!";
+}
+
+}
+
+
+=comment out
+{
+my @ignore_files_in_dir;
+
+my %files_to_ignore;
+
+sub analyze {
+    given($_) {
+	when (-f) {
+	    
+	}
+	when (-d) {
+	    try_image_and_cue() and last;
+	}
+    }
+}
+
+sub try_image_and_cue {
+    my @images = glob($image_glob);
+    my @cues = glob($cue_glob);
+
+    @images = uniquify_images(@images);
+
+    $#images >= 0 && $#cues >= 0 or return 0;
+
+    foreach my $image (@images) {
+	my $cue = select_cue($image, @cues);
+
+#	if (
+    }
+}
+
+
+sub uniquify_images {
+    my %base_map = ();
+    my @images;
+
+    foreach (@_) {
+	my $base = File::Basename($_, @image_sfx);
+	push @{$base_map{$base}}, $_;
+    }
+
+    while (my ($base, $files) = each(%base_map)) {
+	my @files = @$files;
+	if (scalar(@files) > 1) {
+	    print_info("multiple image files: @files");
+	    push @images, select_image(@files);
+	} else {
+	    push @images, $files[0];
+	}
+    }
+
+    return @images;
+}
+
+sub select_image {
+    my $time = -1, $file = '';
+
+    foreach my $f (@_) {
+	my $t = File::stat($f)->mtime();
+	if ($time == -1 || $time >= $t) {
+	    $file = $f;
+	    $time = $t;
+	}
+    }
+
+    print_info("using oldest file: $file");
+
+    return $file;
+}
+
+sub select_toc {
+    my $image = shift;
+    my $base = File::Basename($image, @image_sfx);
+
+    foreach my $t (@_) {
+	my $tb = basebase_name();
+    }
+}
+
+}
+
+
+sub get_files_in_dir {
+    my $dir = shift;
+    my $glob = $global_opts{glob} || '*';
+    my $regex = $global_opts{regex};
+    $glob = '*' unless $glob;
+    return grep {-f && /$regex/} glob("$dir/$glob");
+}
+
+sub read_dir {
+    my $dir = shift;
+    my $glob = $global_opts{glob} || '*';
+    my $regex = $global_opts{regex};
+    $glob = '*' unless $glob;
+    return grep {/$regex/} glob("$dir/$glob");
+}
+
+
+#sub read_dir {
+#    my $glob = $global_opts{glob} || '*';
+#    my @files = glob("$_/$glob");
+#    @files = grep { -f } @files;
+#    
+#    if ($global_opts{recursive}) {
+#	push @files, grep { -d } glob("$_/*");
+#    }
+#
+#    return @files;
+#}
+
+sub find_files {
+    my @files;
+    foreach (@_) {
+	push @files, $_ if -f;
+	push @files, find_files(read_dir($_)) if -d;
+	warn "can't find $_" if !(-f || -d);
+    }
+    return @files;
+}
+
+
+
+sub basebase_name {
+    my $name = shift;
+    my $b;
+
+    while (($b = File::Basename($name, @_)) ne $name) {
+	$name = $b;
+    }
+
+    return $name;
+}
+
+sub all_cases {
+    my %seen;
+    return grep( { !$seen{$_}++ } map( { ($_, ucfirst($_), uc($_)) } @_));
+}
+
+=cut
+
+sub all_cases {
+    my %seen;
+    return grep( { !$seen{$_}++ } map( { ($_, ucfirst($_), uc($_)) } @_));
+}
+
+sub with_dot {
+    return map { ".$_" } @_;
+}
+
+sub as_pattern {
+    return map { "*.$_" } @_;
+}
+
+{
+    sub fsh_join {
+	return join(' ', fsh_quote(@_));
+    }
+
+    sub fsh_quote {
+	my @res = map /[\Q []()*?\E]/ ? qq("$_") : $_, @_;
+	wantarray ? @res : $res[0];
+    }
+
+    sub fsh_copy_to { 
+	my ($dir) = fsh_quote(pop());
+	say "cp -r ", fsh_join(@_), qq( $dir);
+    }
+
+    sub fsh_copy {
+	my $opts = pop || '';
+	say qq/music-tool copy $opts /, fsh_join(@_);
+    }
+
+    sub fsh_update_info {
+	my $opts = pop || '';
+	say qq/music-tool update $opts /, fsh_join(@_);
+    }
+
+    sub fsh_echo {
+	say "echo ", @_;
+    }
+
+}
+
+
+sub cue_extractor {
+}

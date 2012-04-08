@@ -4,32 +4,46 @@ use strict;
 use warnings;
 use Carp;
 use feature qw(say switch);
-
 use Exporter;
+use Scalar::Util;
 
-@ISA = qw(Exporter);
+our @ISA = qw(Exporter);
 
-@EXPORT_OK = qw(sprintfn);
+our @EXPORT_OK = qw(sprintfn);
 
-sub new ($$;$) {
+sub new ($;$) {
     my $class = shift;
-    my $extractor = shift;
     my $convertor = shift;
 
     my $self = {
 	convertor => $convertor
     };
 
-    given (ref($extractor)) {
+    given (defined $extractor ? ref($extractor) : undef) {
+	when (undef) {
+	    # just call the obj->name()
+	    $self->{extractor} = sub ($$) {
+		my ($data, $name) = @_;
+		given 
+		croak "data object can'd do $name" unless $data->can($name);
+		return $obj->$name();
+	    }
+	}
 	when (/CODE/) {
-	    $self->{extractor} = sub ($) {
-		local $_ = $_[0];
-		&$extractor;
+	    # call the CODE with params $obj and $name, and $_ set to $name
+	    $self->{extractor} = sub ($$) {
+		$_ = $_[1];
+		return &$extractor(@_);
 	    }
 	}
 	when (/HASH/) {
-	    $self->{extractor} = sub ($) {
-		$extractor->{$_[0]};
+	    # used to rename parameter names to method names
+	    $self->{extractor} = sub ($$) {
+		my ($obj, $name) = @_;
+		croak "\%HASH extractor doean't have $name key" unless defined $extractor->{$name};
+		$name = $extractor->{$name};
+		croak "data object can'd do $name" unless $obj->can($name);
+		return $obj->$name();
 	    }
 	}
 	when (/^$/) {
@@ -42,48 +56,31 @@ sub new ($$;$) {
 	    croak "can't use \$SCALAR reference as extractor";
 	}
 	default {
-	    $self->{extractor} = sub ($) {
-		$extractor->$_[0]();
+	    # just call the $extractor->name($obj)
+	    $self->{extractor} = sub ($$) {
+		my ($obj, $name) = @_;
+		return $extractor->$name($obj);
 	    }
 	}
     }
 
-    given (ref($convertor)) {
-	when (/CODE/) {
-	    $self->{convertor} = sub ($) {
-		local $_ = $_[0];
-		$convertor->($_[1]);
-	    }
+    if (!defined($convertor)) {
+	$self->{convertor} = sub ($) {return $_[0]};
+    } elsif (ref($convertor) ~~ 'CODE') {
+	$self->{convertor} = sub ($) {
+	    $_ = $_[0];
+	    $convertor->($_[1]);
 	}
-	when (/^$/) {
-	    croak "can't use simple \$SCALAR as convertor" if defined $convertor;
-	    $self->{convertor} = sub ($$) {
-		$_[0];
-	    }
-	}
-	when (/HASH/) {
-	    croak "can't use \%HASH reference as convertor";
-	}
-	when (/ARRAY/) {
-	    croak "can't use \@ARRAY reference as convertor";
-	}
-	when (/SCALAR/) {
-	    croak "can't use \$SCALAR reference as convertor";
-	}
-	default {
-	    croak "convertor can't do `convert'" unless $convertor->can('convert');
-	    $self->{convertor} = sub ($$) {
-		$convertor->convert($_[0], $_[1]);
-	    }
-	}
+    } else {
+	croak "unsupported convertor";
     }
 
     return bless $self, $class;
 }
 
-
-sub sprintf($$;@) {
+sub sprintf($$$;@) {
     my $self = shift;
+    my $data = shift;
     my $_ = shift;
     my @params = @_;
     my $format;
@@ -109,7 +106,7 @@ sub sprintf($$;@) {
 
 	if (defined $+{param}) {
 	    if ($+{param} =~ /^([_a-zA-Z][_a-zA-Z0-9]*)\$$/) {
-		$format .= $self->_replace_with_param($1, \@params) . '$';
+		$format .= $self->_replace_with_param($data, $1, \@params) . '$';
 	    } else {
 		$format .= $+{param};
 	    }
@@ -121,7 +118,7 @@ sub sprintf($$;@) {
 
 	if (defined $+{width}) {
 	    if (defined $+{widthref} && $+{widthref} =~ /^([_a-zA-Z][_a-zA-Z0-9]*)\$$/) {
-		$format .= '*' . $self->_replace_with_param($1, \@params) . '$';
+		$format .= '*' . $self->_replace_with_param($data, $1, \@params) . '$';
 	    } else {
 		$format .= $+{width};
 	    }
@@ -129,7 +126,68 @@ sub sprintf($$;@) {
 
 	if (defined $+{prec}) {
 	    if (defined $+{precref} && $+{precref} =~ /^([_a-zA-Z][_a-zA-Z0-9]*)\$$/) {
-		$format .= '.*' . $self->_replace_with_param($1, \@params) . '$';
+		$format .= '.*' . $self->_replace_with_param($data, $1, \@params) . '$';
+	    } else {
+		$format .= $+{prec};
+	    }
+	}
+
+	$format .= $+{size} if defined $+{size};
+	$format .= $+{conv};
+    }
+
+    return sprintf $format, @params;
+}
+
+sub format($$$;@) {
+    my $self = shift;
+    my $data = shift;
+    my $_ = shift;
+    my @params = @_;
+    my $format;
+
+    while (/(?<verb>[^%]*)? # non-formatting part
+            (?<format>%
+             (?<param>(?&ref))?                       # format parameter
+             (?<flags>[- +0\#]+)?                     # flags
+             (?<vector>v)?                            # vector flag
+             (?<width>\d+|\*(?<widthref>(?&ref))?)?   # minimum width
+             (?<prec>[.](:?\d+|\*(?<prec>(?&ref))?))? # precision
+             (?<size>ll|[lhVqL])?                     # size
+             (?<conv>[%csduoxefgXEGbBpnIDUOF])        # conversion
+            )?
+            (?(DEFINE)
+              (?<id>[_a-zA-Z][_a-zA-Z0-9]*)
+              (?<ref>(:?\d+|(?&id))\$)
+            )
+           /gx) {
+	$format .= $+{verb} if defined $+{verb};
+	next unless defined $+{format};
+	$format .= '%';
+
+	if (defined $+{param}) {
+	    if ($+{param} =~ /^([_a-zA-Z][_a-zA-Z0-9]*)\$$/) {
+		$format .= $self->_replace_with_param($data, $1, \@params) . '$';
+	    } else {
+		$format .= $+{param};
+	    }
+	}
+
+	foreach (qw(flags vector)) {
+	    $format .= $+{$_} if defined $+{$_};
+	}
+
+	if (defined $+{width}) {
+	    if (defined $+{widthref} && $+{widthref} =~ /^([_a-zA-Z][_a-zA-Z0-9]*)\$$/) {
+		$format .= '*' . $self->_replace_with_param($data, $1, \@params) . '$';
+	    } else {
+		$format .= $+{width};
+	    }
+	}
+
+	if (defined $+{prec}) {
+	    if (defined $+{precref} && $+{precref} =~ /^([_a-zA-Z][_a-zA-Z0-9]*)\$$/) {
+		$format .= '.*' . $self->_replace_with_param($data, $1, \@params) . '$';
 	    } else {
 		$format .= $+{prec};
 	    }
@@ -146,25 +204,32 @@ sub _is_param ($) {
     return $_[0] =~ /^[_a-zA-Z][_a-zA-Z0-9]*$/;
 }
 
-sub _replace_with_param ($$\@) {
-    my ($self, $name, $params) = @_;
-    push @$params, $self->_get_param($name);
+sub _replace_with_param ($$$\@) {
+    my ($self, $data, $name, $params) = @_;
+    push @$params, $self->_get_param($data, $name);
     return $#$params + 1;
 }
 
-sub _get_param ($$) {
-    my ($self, $name) = @_;
+sub _get_param ($$$) {
+    my ($self, $data, $name) = @_;
 
-    return $self->_convert($name, $self->_extract($name));
+    return $self->_convert($name, _get_value($data, $name));
 }
 
-sub _extract ($$) {
-    my ($self, $name) = @_;
-    my $value = $self->{extractor}->($name);
-    
-    croak "Can't extract value for `$name'" unless defined $value;
-    
-    $value;
+sub _get_value ($$) {
+    my ($data, $name) = @_;
+
+    if (ref($data) ~~ 'HASH') {
+	return %$data->{$name};
+    } elsif (ref($data) ~~ 'CODE') {
+	$_ = $name;
+	return &$data();
+    } elsif (blessed($data)) {
+	croak "data can't do $name" unless $data->can($name);
+	return $data->$name();
+    } else {
+	croak "unsupported data";
+    }
 }
 
 sub _convert ($$$) {
@@ -173,15 +238,15 @@ sub _convert ($$$) {
     return $self->{convertor}->($value, $name);
 }
 
-sub sprintfn {
-    my $extractor = shift;
-    my $convertor = undef;
-    my $format = shift;
+# sub sprintfn {
+#     my $extractor = shift;
+#     my $convertor = undef;
+#     my $format = shift;
 
-    do { $convertor = $format; $format = shift } if ref($format);
+#     do { $convertor = $format; $format = shift } if ref($format);
 
-    return Data::Format->new($extractor, $convertor)->sprintf($format, @_);
-}
+#     return Data::Format->new($extractor, $convertor)->sprintf($format, @_);
+# }
 
 1;
 
